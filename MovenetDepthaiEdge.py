@@ -1,18 +1,23 @@
 import marshal
 import numpy as np
-import cv2
-from collections import namedtuple
 from pathlib import Path
-from FPS import FPS
 import depthai as dai
-import time
-
-from math import gcd
-from string import Template
-
+import cv2
 SCRIPT_DIR = Path(__file__).resolve().parent
 MOVENET_LIGHTNING_MODEL = SCRIPT_DIR / "models/movenet_singlepose_lightning_U8_transpose.blob"
 MOVENET_THUNDER_MODEL = SCRIPT_DIR / "models/movenet_singlepose_thunder_U8_transpose.blob"
+
+# Set ROI for initial cropping
+INITIAL_CROP = (0.1, 0.1, 0.9, 0.9)
+
+
+# ROI calculations
+xmin = int(INITIAL_CROP[0] * 720 + 280)
+ymin = int(INITIAL_CROP[1] * 720)
+xmax = int(INITIAL_CROP[2] * 720 + 280)
+ymax = int(INITIAL_CROP[3] * 720)
+xdelta = xmax - xmin
+ydelta = ymax - ymin
 
 # Dictionary that maps from joint names to keypoint indices.
 KEYPOINT_DICT = {
@@ -36,7 +41,7 @@ KEYPOINT_DICT = {
 }
 
 class Body:
-    def __init__(self, scores=None, keypoints_norm=None, keypoints=None, score_thresh=None, crop_region=None, next_crop_region=None):
+    def __init__(self, scores=None, keypoints_norm=None, score_thresh=None):
         """
         Attributes:
         scores : scores of the keypoints
@@ -44,62 +49,18 @@ class Body:
         keypoints : keypoints coordinates (x,y) in pixels in the source image
         score_thresh : score threshold used
         crop_region : cropped region on which the current body was inferred
-        next_crop_region : cropping region calculated from the current body keypoints and that will be used on next frame
         """
         self.scores = scores 
-        self.keypoints_norm = keypoints_norm 
-        self.keypoints = keypoints
+        self.keypoints_norm = keypoints_norm
+        self.keypoints = []
+        for k in keypoints_norm:
+            self.keypoints.append((xmin + xdelta * k[0], ymin + ydelta * k[1]))
+        self.keypoints = np.array(self.keypoints).astype(np.int32)
         self.score_thresh = score_thresh
-        self.crop_region = crop_region
-        self.next_crop_region = next_crop_region
 
     def print(self):
         attrs = vars(self)
         print('\n'.join("%s: %s" % item for item in attrs.items()))
-
-CropRegion = namedtuple('CropRegion',['xmin', 'ymin', 'xmax',  'ymax', 'size']) # All values are in pixel. The region is a square of size 'size' pixels
-
-def find_isp_scale_params(size, is_height=True):
-    """
-    Find closest valid size close to 'size' and and the corresponding parameters to setIspScale()
-    This function is useful to work around a bug in depthai where ImageManip is scrambling images that have an invalid size
-    is_height : boolean that indicates if the value is the height or the width of the image
-    Returns: valid size, (numerator, denominator)
-    """
-    # We want size >= 288
-    if size < 288:
-        size = 288
-    
-    # We are looking for the list on integers that are divisible by 16 and
-    # that can be written like n/d where n <= 16 and d <= 63
-    if is_height:
-        reference = 1080 
-        other = 1920
-    else:
-        reference = 1920 
-        other = 1080
-    size_candidates = {}
-    for s in range(288,reference,16):
-        f = gcd(reference, s)
-        n = s//f
-        d = reference//f
-        if n <= 16 and d <= 63 and int(round(other * n / d) % 2 == 0):
-            size_candidates[s] = (n, d)
-            
-    # What is the candidate size closer to 'size' ?
-    min_dist = -1
-    for s in size_candidates:
-        dist = abs(size - s)
-        if min_dist == -1:
-            min_dist = dist
-            candidate = s
-        else:
-            if dist > min_dist: break
-            candidate = s
-            min_dist = dist
-    return candidate, size_candidates[candidate]
-
-    
 
 class MovenetDepthai:
     """
@@ -118,8 +79,6 @@ class MovenetDepthai:
                     the image is done or not,
     - smart_crop : boolen which indicates if cropping from previous frame detection is done or not,
     - internal_fps : when using the internal color camera as input source, set its FPS to this value (calling setFps()).
-    - internal_frame_height : when using the internal color camera, set the frame height (calling setIspScale()).
-                                The width is calculated accordingly to height and depends on value of 'crop'
     - stats : True or False, when True, display the global FPS when exiting.            
     """
     def __init__(self, input_src="rgb",
@@ -128,11 +87,10 @@ class MovenetDepthai:
                 crop=False,
                 smart_crop = True,
                 internal_fps=None,
-                internal_frame_height=640,
                 stats=True):
 
         self.model = model 
-        
+        self.score_thresh = score_thresh
         
         if model == "lightning":
             self.model = str(MOVENET_LIGHTNING_MODEL)
@@ -149,8 +107,6 @@ class MovenetDepthai:
         print(f"Using blob file : {self.model}")
 
         print(f"MoveNet imput size : {self.pd_input_length}x{self.pd_input_length}x3")
-
-        self.score_thresh = score_thresh   
         
         self.crop = crop
         self.smart_crop = smart_crop
@@ -170,16 +126,6 @@ class MovenetDepthai:
             print(f"Internal camera FPS set to: {self.internal_fps}")
 
             self.video_fps = self.internal_fps # Used when saving the output in a video file. Should be close to the real fps
-            
-            if self.crop:
-                self.frame_size, self.scale_nd = find_isp_scale_params(internal_frame_height)
-                self.img_h = self.img_w = self.frame_size
-            else:
-                width, self.scale_nd = find_isp_scale_params(internal_frame_height * 1920 / 1080, is_height=False)
-                self.img_h = int(round(1080 * self.scale_nd[0] / self.scale_nd[1]))
-                self.img_w = int(round(1920 * self.scale_nd[0] / self.scale_nd[1]))
-                self.frame_size = self.img_w
-            print(f"Internal camera image size: {self.img_w} x {self.img_h}")
 
         else:
             print(f"Input source '{input_src}' is not supported in edge mode !")
@@ -189,24 +135,13 @@ class MovenetDepthai:
 
         # Defines the default crop region (pads the full image from both sides to make it a square image) 
         # Used when the algorithm cannot reliably determine the crop region from the previous frame.
-        box_size = max(self.img_w, self.img_h)
-        x_min = (self.img_w - box_size) // 2
-        y_min = (self.img_h - box_size) // 2
-        self.init_crop_region = CropRegion(x_min, y_min, x_min+box_size, y_min+box_size, box_size)
-        self.crop_region = self.init_crop_region
         
         self.device = dai.Device(self.create_pipeline())
         print("Pipeline started")
 
-        # Define data queues 
-        if not self.laconic:
-            self.q_video = self.device.getOutputQueue(name="cam_out", maxSize=1, blocking=False)
-        self.q_processing_out = self.device.getOutputQueue(name="processing_out", maxSize=4, blocking=False)
         # For debugging
         # self.q_manip_out = self.device.getOutputQueue(name="manip_out", maxSize=1, blocking=False)
    
-        self.fps = FPS()
-
         self.nb_frames = 0
         self.nb_pd_inferences = 0
 
@@ -219,32 +154,29 @@ class MovenetDepthai:
         # ColorCamera
         print("Creating Color Camera...")
         cam = pipeline.create(dai.node.ColorCamera) 
-        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_4_K)
         cam.setInterleaved(False)
-        cam.setIspScale(self.scale_nd[0], self.scale_nd[1])
         cam.setFps(self.internal_fps)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
-        if self.crop:
-            cam.setVideoSize(self.frame_size, self.frame_size)
-            cam.setPreviewSize(self.frame_size, self.frame_size)
-        else: 
-            cam.setVideoSize(self.img_w, self.img_h)
-            cam.setPreviewSize(self.img_w, self.img_h)
+        cam.setPreviewSize(2160, 2160)
         
-        if not self.laconic:
-            cam_out = pipeline.create(dai.node.XLinkOut)
-            cam_out.setStreamName("cam_out")
-            cam.video.link(cam_out.input)
+        cam_out = pipeline.create(dai.node.XLinkOut)
+        cam_out.setStreamName("cam_out")
+        cam.video.link(cam_out.input)
 
-        # ImageManip for cropping
-        manip = pipeline.create(dai.node.ImageManip)
-        manip.setMaxOutputFrameSize(self.pd_input_length*self.pd_input_length*3)
-        manip.setWaitForConfigInput(True)
-        manip.inputImage.setQueueSize(1)
-        manip.inputImage.setBlocking(False)            
+        # Initial ROI cropping
+        crop_manip = pipeline.create(dai.node.ImageManip)
+        crop_manip.initialConfig.setCropRect(INITIAL_CROP)
+        crop_manip.inputImage.setQueueSize(3)
+        maxSize = int(2160 * INITIAL_CROP[3] - INITIAL_CROP[1]) * int(2160 * INITIAL_CROP[2] - INITIAL_CROP[0])
+        crop_manip.setMaxOutputFrameSize(maxSize*3) # Worst case
+        cam.preview.link(crop_manip.inputImage)
 
-        cam.preview.link(manip.inputImage)
+        downscale_manip = pipeline.create(dai.node.ImageManip)
+        downscale_manip.setMaxOutputFrameSize(self.pd_input_length*self.pd_input_length*3)
+        downscale_manip.initialConfig.setResize(self.pd_input_length, self.pd_input_length)
+        crop_manip.out.link(downscale_manip.inputImage)
 
         # For debugging
         # manip_out = pipeline.createXLinkOut()
@@ -255,101 +187,135 @@ class MovenetDepthai:
         print("Creating Pose Detection Neural Network...")
         pd_nn = pipeline.create(dai.node.NeuralNetwork)
         pd_nn.setBlobPath(str(Path(self.model).resolve().absolute()))
+        downscale_manip.out.link(pd_nn.input)
         # pd_nn.input.setQueueSize(1)
         # Increase threads for detection
         # pd_nn.setNumInferenceThreads(2)
 
-        manip.out.link(pd_nn.input)
 
         # Define processing script
         processing_script = pipeline.create(dai.node.Script)
-        processing_script.setScript(self.build_processing_script())
-        
-
+        with open("script.py", "r") as f:
+            processing_script.setScript(f.read())
         pd_nn.out.link(processing_script.inputs['from_pd_nn'])
-        processing_script.outputs['to_manip_cfg'].link(manip.inputConfig)
 
         # Define link to send result to host 
         processing_out = pipeline.create(dai.node.XLinkOut)
         processing_out.setStreamName("processing_out")
-
         processing_script.outputs['to_host'].link(processing_out.input)
+
+        # Crop based on the hand
+        manip_script = pipeline.create(dai.node.Script)
+        processing_script.outputs['to_host'].link(manip_script.inputs['pd_in']) # Pose detections
+        crop_manip.out.link(manip_script.inputs['frame']) # Pose detections
+        manip_script.setScript("""
+        import marshal
+        REGION = 192
+        while True:
+            frame = node.io['frame'].get()
+            # node.warn(f"{frame.getWidth()}, {frame.getHeight()}")
+            pdin = node.io['pd_in'].get()
+            result = marshal.loads(pdin.getData())
+            keypoints = list(zip(result["xnorm"], result["ynorm"]))
+            left_wrist = keypoints[9]
+            right_wrist = keypoints[10]
+            coords = left_wrist if left_wrist[1] > right_wrist[1] else right_wrist
+
+            xmin = int(frame.getWidth() * coords[0]) - REGION
+            ymin = int(frame.getHeight() * coords[1]) - REGION
+            if xmin < 0: xmin = 0
+            if ymin < 0: ymin = 0
+            xmax = xmin + 2 * REGION
+            ymax = ymin + 2 * REGION
+            # node.warn(f"{coords[0]}, {coords[1]}")
+
+            cfg = ImageManipConfig()
+            # node.warn(f"{xmin}, {ymin}, {xmax}, {ymax}")
+            cfg.setCropRect(xmin, ymin, xmax, ymax)
+            cfg.setResize(384, 384)
+            cfg.setKeepAspectRatio(False)
+            node.io['manip_cfg'].send(cfg)
+            node.io['manip_img'].send(frame)
+            # node.warn(keypoints)
+        """)
+
+        qr_manip = pipeline.create(dai.node.ImageManip)
+        qr_manip.setMaxOutputFrameSize(384 * 384 * 3)
+        qr_manip.setWaitForConfigInput(True)
+        manip_script.outputs['manip_img'].link(qr_manip.inputImage)
+        manip_script.outputs['manip_cfg'].link(qr_manip.inputConfig)
+
+        crop_out = pipeline.create(dai.node.XLinkOut)
+        crop_out.setStreamName("crop_out")
+        qr_manip.out.link(crop_out.input)
+        
+        # TODO: add QR code model
 
         print("Pipeline created.")
 
-        return pipeline        
-
-    def build_processing_script(self):
-        '''
-        The code of the scripting node 'processing_script' depends on :
-            - the NN model (thunder or lightning),
-            - the score threshold,
-            - the video frame shape
-        So we build this code from the content of the file template_processing_script.py which is a python template
-        '''
-        # Read the template
-        with open('template_processing_script.py', 'r') as file:
-            template = Template(file.read())
-        
-        # Perform the substitution
-        code = template.substitute(
-                    _init_crop_region = str(self.init_crop_region._asdict()).replace("OrderedDict", "dict"),
-                    _pd_input_length = self.pd_input_length,
-                    _score_thresh = self.score_thresh,
-                    _img_w = self.img_w,
-                    _img_h = self.img_h,
-                    _smart_crop = self.smart_crop
-        )
-        # Remove comments and empty lines
-        import re
-        code = re.sub(r'"{3}.*?"{3}', '', code, flags=re.DOTALL)
-        code = re.sub(r'#.*', '', code)
-        code = re.sub('\n\s*\n', '\n', code)
-        # For debuging
-        with open("tmp_code.py", "w") as file:
-            file.write(code)
-
-        return code
+        return pipeline
 
     def pd_postprocess(self, inference):
         result = marshal.loads(inference.getData())
         scores = np.array(result["scores"])
         keypoints_norm = np.array(list(zip(result["xnorm"], result["ynorm"])))
-        keypoints = np.array(list(zip(result["x"], result["y"])))
-        next_crop_region = CropRegion(**result["next_crop_region"])
-        body = Body(scores, keypoints_norm, keypoints, self.score_thresh, self.crop_region, next_crop_region)
+        body = Body(scores, keypoints_norm, self.score_thresh)
         return body
 
     def next_frame(self):
-
-        self.fps.update()
-
-        # Get the device camera frame if wanted
-        if self.laconic:
-            frame = np.zeros((self.frame_size, self.frame_size, 3), dtype=np.uint8)
-        else:
-            in_video = self.q_video.get()
-            frame = in_video.getCvFrame()
-
-        # For debugging
-        # manip = self.q_manip_out.get().getCvFrame()
-        # cv2.imshow("manip", manip)
-
+        in_video = self.q_video.get()
+        frame = cv2.resize(in_video.getCvFrame(), (1280, 720)) # 4k -> 720P (divided by 3)
+        # Initial ROI visualization
+        frame = cv2.rectangle(frame,
+            (int(INITIAL_CROP[0] * 720 + 280), int(INITIAL_CROP[1] * 720)),
+            (int(INITIAL_CROP[2] * 720 + 280), int(INITIAL_CROP[3] * 720)),
+            (0, 127, 255), 2)
         # Get result from device
         inference = self.q_processing_out.get()
         body = self.pd_postprocess(inference)
-        self.crop_region = body.next_crop_region
 
         # Statistics
         if self.stats:
             self.nb_frames += 1
             self.nb_pd_inferences += 1
-
         return frame, body
 
 
-    def exit(self):
-        # Print some stats
-        if self.stats:
-            print(f"FPS : {self.fps.global_duration():.1f} f/s (# frames = {self.fps.nb_frames()})")
+    def draw(self, frame, body):
+        LINES_BODY = [[4,2],[2,0],[0,1],[1,3],
+                    [10,8],[8,6],[6,5],[5,7],[7,9],
+                    [6,12],[12,11],[11,5],
+                    [12,14],[14,16],[11,13],[13,15]]
+
+        lines = [np.array([body.keypoints[point] for point in line]) for line in LINES_BODY if body.scores[line[0]] > self.score_thresh and body.scores[line[1]] > self.score_thresh]
+        cv2.polylines(frame, lines, False, (255, 180, 90), 2, cv2.LINE_AA)
+        
+        for i,x_y in enumerate(body.keypoints):
+            if body.scores[i] > self.score_thresh:
+                if i % 2 == 1:
+                    color = (0,255,0) 
+                elif i == 0:
+                    color = (0,255,255)
+                else:
+                    color = (0,0,255)
+                cv2.circle(frame, (x_y[0], x_y[1]), 4, color, -11)
+
+    def run(self):
+        self.q_video = self.device.getOutputQueue(name="cam_out", maxSize=1, blocking=False)
+        self.q_processing_out = self.device.getOutputQueue(name="processing_out", maxSize=4, blocking=False)
+        q_crop_out = self.device.getOutputQueue(name="crop_out", maxSize=4, blocking=False)
+
+        while True:
+            # Run movenet on next frame
+            frame, body = self.next_frame()
+            self.draw(frame, body)
+            cv2.imshow("frame", frame)
+
+            if q_crop_out.has():
+                imgFrame = q_crop_out.get()
+                cv2.imshow("Hand Cropped", imgFrame.getCvFrame())
+
+            key = cv2.waitKey(1)
+            if key == 27 or key == ord('q'):
+                break
            

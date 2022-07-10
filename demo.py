@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-from MovenetRenderer import MovenetRenderer
 
 
 parser = argparse.ArgumentParser()
@@ -27,10 +26,7 @@ parser.add_argument("-o","--output",
     
 args = parser.parse_args()
 
-if args.edge:
-    from MovenetDepthaiEdge import MovenetDepthai
-else:
-    from MovenetDepthai import MovenetDepthai
+from MovenetDepthaiEdge import MovenetDepthai
 
 pose = MovenetDepthai(input_src=args.input, 
             model=args.model,    
@@ -38,21 +34,6 @@ pose = MovenetDepthai(input_src=args.input,
             crop=args.crop,    
             smart_crop=not args.no_smart_crop,     
             internal_fps=args.internal_fps,
-            internal_frame_height=args.internal_frame_height
             )
 
-renderer = MovenetRenderer(
-                pose, 
-                output=args.output)
-
-while True:
-    # Run movenet on next frame
-    frame, body = pose.next_frame()
-    if frame is None: break
-    # Draw 2d skeleton
-    frame = renderer.draw(frame, body)
-    key = renderer.waitKey(delay=1)
-    if key == 27 or key == ord('q'):
-        break
-renderer.exit()
-pose.exit()
+pose.run()
