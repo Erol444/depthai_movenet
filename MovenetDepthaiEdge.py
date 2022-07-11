@@ -3,6 +3,8 @@ import numpy as np
 from pathlib import Path
 import depthai as dai
 import cv2
+import blobconverter
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 MOVENET_LIGHTNING_MODEL = SCRIPT_DIR / "models/movenet_singlepose_lightning_U8_transpose.blob"
 MOVENET_THUNDER_MODEL = SCRIPT_DIR / "models/movenet_singlepose_thunder_U8_transpose.blob"
@@ -10,6 +12,18 @@ MOVENET_THUNDER_MODEL = SCRIPT_DIR / "models/movenet_singlepose_thunder_U8_trans
 # Set ROI for initial cropping
 INITIAL_CROP = (0.1, 0.1, 0.9, 0.9)
 
+class TextHelper:
+    def __init__(self) -> None:
+        self.bg_color = (0, 0, 0)
+        self.color = (255, 255, 255)
+        self.text_type = cv2.FONT_HERSHEY_SIMPLEX
+        self.line_type = cv2.LINE_AA
+    def putText(self, frame, text, coords):
+        cv2.putText(frame, text, coords, self.text_type, 0.8, self.bg_color, 3, self.line_type)
+        cv2.putText(frame, text, coords, self.text_type, 0.8, self.color, 1, self.line_type)
+    def rectangle(self, frame, p1, p2):
+        cv2.rectangle(frame, p1, p2, self.bg_color, 6)
+        cv2.rectangle(frame, p1, p2, self.color, 1)
 
 # ROI calculations
 xmin = int(INITIAL_CROP[0] * 720 + 280)
@@ -149,7 +163,7 @@ class MovenetDepthai:
         print("Creating pipeline...")
         # Start defining a pipeline
         pipeline = dai.Pipeline()
-        pipeline.setOpenVINOVersion(dai.OpenVINO.Version.VERSION_2021_3)
+        pipeline.setOpenVINOVersion(dai.OpenVINO.Version.VERSION_2021_4)
 
         # ColorCamera
         print("Creating Color Camera...")
@@ -206,31 +220,41 @@ class MovenetDepthai:
 
         # Crop based on the hand
         manip_script = pipeline.create(dai.node.Script)
+        manip_script.setProcessor(dai.ProcessorType.LEON_CSS)
         processing_script.outputs['to_host'].link(manip_script.inputs['pd_in']) # Pose detections
-        crop_manip.out.link(manip_script.inputs['frame']) # Pose detections
+        
+        crop_manip.out.link(manip_script.inputs['frame']) # Cropped HQ frame
+        manip_script.inputs['frame'].setBlocking(False)
+        manip_script.inputs['frame'].setQueueSize(1)
+
         manip_script.setScript("""
         import marshal
         REGION = 192
         while True:
             frame = node.io['frame'].get()
-            # node.warn(f"{frame.getWidth()}, {frame.getHeight()}")
+            node.warn(f"{frame.getWidth()}x{frame.getHeight()}")
             pdin = node.io['pd_in'].get()
             result = marshal.loads(pdin.getData())
             keypoints = list(zip(result["xnorm"], result["ynorm"]))
             left_wrist = keypoints[9]
             right_wrist = keypoints[10]
-            coords = left_wrist if left_wrist[1] > right_wrist[1] else right_wrist
+            coords = left_wrist if left_wrist[1] < right_wrist[1] else right_wrist
 
-            xmin = int(frame.getWidth() * coords[0]) - REGION
-            ymin = int(frame.getHeight() * coords[1]) - REGION
-            if xmin < 0: xmin = 0
-            if ymin < 0: ymin = 0
-            xmax = xmin + 2 * REGION
-            ymax = ymin + 2 * REGION
+            NORM_REG_X = REGION / frame.getWidth()
+            NORM_REG_Y = REGION / frame.getHeight()
+
+            xmin = coords[0] - NORM_REG_X
+            ymin = coords[1] - NORM_REG_Y
+            if xmin < 0: xmin = 0.0
+            if ymin < 0: ymin = 0.0
+            xmax = xmin + 2 * NORM_REG_X
+            ymax = ymin + 2 * NORM_REG_Y
+            if 1 < xmax: xmax = 1.0
+            if 1 < ymax: ymax = 1.0
             # node.warn(f"{coords[0]}, {coords[1]}")
 
             cfg = ImageManipConfig()
-            # node.warn(f"{xmin}, {ymin}, {xmax}, {ymax}")
+            node.warn(f"{xmin}, {ymin}, {xmax}, {ymax}")
             cfg.setCropRect(xmin, ymin, xmax, ymax)
             cfg.setResize(384, 384)
             cfg.setKeepAspectRatio(False)
@@ -240,16 +264,25 @@ class MovenetDepthai:
         """)
 
         qr_manip = pipeline.create(dai.node.ImageManip)
+        qr_manip.initialConfig.setResize(384, 384)
         qr_manip.setMaxOutputFrameSize(384 * 384 * 3)
         qr_manip.setWaitForConfigInput(True)
-        manip_script.outputs['manip_img'].link(qr_manip.inputImage)
         manip_script.outputs['manip_cfg'].link(qr_manip.inputConfig)
+        manip_script.outputs['manip_img'].link(qr_manip.inputImage)
 
         crop_out = pipeline.create(dai.node.XLinkOut)
         crop_out.setStreamName("crop_out")
         qr_manip.out.link(crop_out.input)
         
-        # TODO: add QR code model
+        qr_nn = pipeline.create(dai.node.MobileNetDetectionNetwork)
+        qr_nn.setConfidenceThreshold(0.3)
+        qr_nn.setBlobPath(blobconverter.from_zoo(name="qr_code_detection_384x384", zoo_type="depthai", shaves=6))
+        qr_manip.out.link(qr_nn.input)
+
+        qr_out = pipeline.create(dai.node.XLinkOut)
+        qr_out.setStreamName("qr_out")
+        qr_nn.out.link(qr_out.input)
+
 
         print("Pipeline created.")
 
@@ -299,11 +332,34 @@ class MovenetDepthai:
                 else:
                     color = (0,0,255)
                 cv2.circle(frame, (x_y[0], x_y[1]), 4, color, -11)
+    
+    def expandDetection(self, det, percent=2):
+        percent /= 100
+        det.xmin -= percent
+        det.ymin -= percent
+        det.xmax += percent
+        det.ymax += percent
+        if det.xmin < 0: det.xmin = 0
+        if det.ymin < 0: det.ymin = 0
+        if det.xmax > 1: det.xmax = 1
+        if det.ymax > 1: det.ymax = 1
+
+    # nn data, being the bounding box locations, are in <0..1> range - they need to be normalized with frame width/height
+    def frameNorm(self, frame, bbox):
+        normVals = np.full(len(bbox), frame.shape[0])
+        normVals[::2] = frame.shape[1]
+        return (np.clip(np.array(bbox), 0, 1) * normVals).astype(int)
 
     def run(self):
-        self.q_video = self.device.getOutputQueue(name="cam_out", maxSize=1, blocking=False)
-        self.q_processing_out = self.device.getOutputQueue(name="processing_out", maxSize=4, blocking=False)
-        q_crop_out = self.device.getOutputQueue(name="crop_out", maxSize=4, blocking=False)
+        self.q_video = self.device.getOutputQueue(name="cam_out")
+        self.q_processing_out = self.device.getOutputQueue(name="processing_out")
+        q_crop_out = self.device.getOutputQueue(name="crop_out")
+        q_qr = self.device.getOutputQueue(name="qr_out")
+
+        c = TextHelper()
+
+        crop_frame = None
+        detections = []
 
         while True:
             # Run movenet on next frame
@@ -312,8 +368,22 @@ class MovenetDepthai:
             cv2.imshow("frame", frame)
 
             if q_crop_out.has():
-                imgFrame = q_crop_out.get()
-                cv2.imshow("Hand Cropped", imgFrame.getCvFrame())
+                crop_frame = q_crop_out.get().getCvFrame()
+
+            if q_qr.has():
+                detections = q_qr.get().detections
+                print('new detections', len(detections))
+
+            if crop_frame is not None:
+                for det in detections:
+                    self.expandDetection(det)
+                    bbox = self.frameNorm(crop_frame, (det.xmin, det.ymin, det.xmax, det.ymax))
+                    c.rectangle(crop_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]))
+                    c.putText(crop_frame, f"{int(det.confidence * 100)}%", (bbox[0] + 10, bbox[1] + 20))
+                    # if DECODE:
+                    #     text = decode(frame, bbox, detector)
+                    #     c.putText(frame, text, (bbox[0] + 10, bbox[1] + 40))
+                cv2.imshow("Hand Cropped", crop_frame)
 
             key = cv2.waitKey(1)
             if key == 27 or key == ord('q'):
