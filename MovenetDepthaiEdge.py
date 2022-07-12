@@ -3,14 +3,21 @@ import numpy as np
 from pathlib import Path
 import depthai as dai
 import cv2
-import blobconverter
-
+from pyzbar.pyzbar import decode
+import time
+import math
+from cam_control import CamControl
 SCRIPT_DIR = Path(__file__).resolve().parent
 MOVENET_LIGHTNING_MODEL = SCRIPT_DIR / "models/movenet_singlepose_lightning_U8_transpose.blob"
 MOVENET_THUNDER_MODEL = SCRIPT_DIR / "models/movenet_singlepose_thunder_U8_transpose.blob"
 
-# Set ROI for initial cropping
-INITIAL_CROP = (0.1, 0.1, 0.9, 0.9)
+#-------------[USER CONFIG]-----------
+
+CROP_ROI = (0.1, 0.1, 0.9, 0.9) # Set ROI for initial cropping
+DEBUG = True # Whether to debug the app (show additional frames, bounding boxes)
+DECODE = True # Decode QR code
+#-------------------------------------
+
 
 class TextHelper:
     def __init__(self) -> None:
@@ -18,20 +25,88 @@ class TextHelper:
         self.color = (255, 255, 255)
         self.text_type = cv2.FONT_HERSHEY_SIMPLEX
         self.line_type = cv2.LINE_AA
-    def putText(self, frame, text, coords):
-        cv2.putText(frame, text, coords, self.text_type, 0.8, self.bg_color, 3, self.line_type)
-        cv2.putText(frame, text, coords, self.text_type, 0.8, self.color, 1, self.line_type)
-    def rectangle(self, frame, p1, p2):
-        cv2.rectangle(frame, p1, p2, self.bg_color, 6)
-        cv2.rectangle(frame, p1, p2, self.color, 1)
+    def putText(self, frame, text, coords, size = 0.8, thickness = 1):
+        cv2.putText(frame, text, coords, self.text_type, size, self.bg_color, thickness * 3, self.line_type)
+        cv2.putText(frame, text, coords, self.text_type, size, self.color, thickness, self.line_type)
+    def rectangle(self, frame, p1, p2, color = None):
+        if color is None:
+            cv2.rectangle(frame, p1, p2, self.bg_color, 6)
+            cv2.rectangle(frame, p1, p2, self.color, 1)
+        else:
+            cv2.rectangle(frame, p1, p2, color, 5)
 
-# ROI calculations
-xmin = int(INITIAL_CROP[0] * 720 + 280)
-ymin = int(INITIAL_CROP[1] * 720)
-xmax = int(INITIAL_CROP[2] * 720 + 280)
-ymax = int(INITIAL_CROP[3] * 720)
-xdelta = xmax - xmin
-ydelta = ymax - ymin
+class BoundingBox:
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+
+    def __init__(self, bb = None):
+        if bb is not None:
+            if isinstance(bb, tuple):
+                self.xmin = bb[0]
+                self.ymin = bb[1]
+                self.xmax = bb[2]
+                self.ymax = bb[3]
+            else: # object
+                self.xmin = bb.xmin
+                self.ymin = bb.ymin
+                self.xmax = bb.xmax
+                self.ymax = bb.ymax
+
+            self.xdelta = self.xmax - self.xmin
+            self.ydelta = self.ymax - self.ymin
+
+    def __str__(self) -> str:
+        return f"{self.xmin}, {self.ymin}, {self.xmax}, {self.ymax}"
+    
+    def get_tuple(self):
+        return (self.xmin, self.ymin, self.xmax, self.ymax)
+    
+    def calculate_new_bb(self, bb):
+        bb = BoundingBox(bb)
+        return BoundingBox((
+            self.xmin + self.xdelta * bb.xmin,
+            self.ymin + self.ydelta * bb.ymin,
+            self.xmin + self.xdelta * bb.xmax,
+            self.ymin + self.ydelta * bb.ymax,
+        ))
+
+    def normalize_point(self, x: float, y: float, mult = None):
+        new_x = self.xmin + self.xdelta * x
+        new_y = self.ymin + self.ydelta * y
+        if mult is None:
+            return (new_x, new_y)
+        else:
+            return (int(new_x * mult[0]), int(new_y * mult[1]))
+
+    def normalize_to_frame(self, frame):
+        return (
+            (int(frame.shape[1] * self.xmin), int(frame.shape[0] * self.ymin)),
+            (int(frame.shape[1] * self.xmax), int(frame.shape[0] * self.ymax))
+            )
+
+    def crop_frame(self, frame):
+        topLeft, bottomRight = self.normalize_to_frame(frame)
+        return frame[topLeft[1]: bottomRight[1], topLeft[0]: bottomRight[0]]
+
+    def calc_shape_size(self, shape):
+        return math.ceil(self.xdelta * shape[0]) * math.ceil(self.ydelta * shape[1]) * 3
+
+
+# We send ISP frame (5312x6000) to the device, but use 4k video frame (3840x2160) in the pipeline (crop/detection)
+isp_to_video = BoundingBox((0.0, 0.248987513, 1.0, 0.751012487))
+
+DOWNSCALE_48MP = (885, 1000) # Downscale by 5
+
+# Crop 4k video frame to square to get 1:1 aspect ratio
+CROP_SQR = (0.21875, 0, 0.78125, 1.0)
+crop_square = isp_to_video.calculate_new_bb(CROP_SQR)
+crop_square_manip = BoundingBox(CROP_SQR)
+
+# Crop based on the specified CROP ROI
+initial_crop = crop_square.calculate_new_bb(CROP_ROI) # Crop based on INITIAL_CROP
+initial_crop_manip = crop_square_manip.calculate_new_bb(CROP_ROI)
 
 # Dictionary that maps from joint names to keypoint indices.
 KEYPOINT_DICT = {
@@ -68,7 +143,7 @@ class Body:
         self.keypoints_norm = keypoints_norm
         self.keypoints = []
         for k in keypoints_norm:
-            self.keypoints.append((xmin + xdelta * k[0], ymin + ydelta * k[1]))
+            self.keypoints.append(initial_crop.normalize_point(k[0], k[1], mult=DOWNSCALE_48MP))
         self.keypoints = np.array(self.keypoints).astype(np.int32)
         self.score_thresh = score_thresh
 
@@ -95,14 +170,7 @@ class MovenetDepthai:
     - internal_fps : when using the internal color camera as input source, set its FPS to this value (calling setFps()).
     - stats : True or False, when True, display the global FPS when exiting.            
     """
-    def __init__(self, input_src="rgb",
-                model=None, 
-                score_thresh=0.2,
-                crop=False,
-                smart_crop = True,
-                internal_fps=None,
-                stats=True):
-
+    def __init__(self, model=None, score_thresh=0.2):
         self.model = model 
         self.score_thresh = score_thresh
         
@@ -122,42 +190,9 @@ class MovenetDepthai:
 
         print(f"MoveNet imput size : {self.pd_input_length}x{self.pd_input_length}x3")
         
-        self.crop = crop
-        self.smart_crop = smart_crop
-        self.internal_fps = internal_fps
-        self.stats = stats
-        
-        if input_src is None or input_src == "rgb" or input_src == "rgb_laconic":
-            self.input_type = "rgb" # OAK* internal color camera
-            self.laconic = "laconic" in input_src # Camera frames are not sent to the host
-            if internal_fps is None:
-                if "thunder" in str(model):
-                    self.internal_fps = 12
-                else:
-                    self.internal_fps = 26
-            else:
-                self.internal_fps = internal_fps
-            print(f"Internal camera FPS set to: {self.internal_fps}")
-
-            self.video_fps = self.internal_fps # Used when saving the output in a video file. Should be close to the real fps
-
-        else:
-            print(f"Input source '{input_src}' is not supported in edge mode !")
-            print("Valid input sources: 'rgb', 'rgb_laconic'")
-            import sys
-            sys.exit()
-
-        # Defines the default crop region (pads the full image from both sides to make it a square image) 
-        # Used when the algorithm cannot reliably determine the crop region from the previous frame.
-        
         self.device = dai.Device(self.create_pipeline())
         print("Pipeline started")
 
-        # For debugging
-        # self.q_manip_out = self.device.getOutputQueue(name="manip_out", maxSize=1, blocking=False)
-   
-        self.nb_frames = 0
-        self.nb_pd_inferences = 0
 
     def create_pipeline(self):
         print("Creating pipeline...")
@@ -165,37 +200,50 @@ class MovenetDepthai:
         pipeline = dai.Pipeline()
         pipeline.setOpenVINOVersion(dai.OpenVINO.Version.VERSION_2021_4)
 
+
         # ColorCamera
         print("Creating Color Camera...")
         cam = pipeline.create(dai.node.ColorCamera) 
-        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_4_K)
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_13_MP) # 5312x6000 IMX582
+        cam.initialControl.setManualFocus(40)
         cam.setInterleaved(False)
-        cam.setFps(self.internal_fps)
+        cam.setFps(5)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
-        cam.setPreviewSize(2160, 2160)
+
+        cam.initialControl.setSharpness(0)
+        cam.initialControl.setLumaDenoise(0)
+        cam.initialControl.setChromaDenoise(4)
         
+        camControlIn = pipeline.create(dai.node.XLinkIn)
+        camControlIn.setStreamName('cam_control')
+        camControlIn.setMaxDataSize(1)
+        camControlIn.out.link(cam.inputControl)
+
         cam_out = pipeline.create(dai.node.XLinkOut)
         cam_out.setStreamName("cam_out")
-        cam.video.link(cam_out.input)
-
-        # Initial ROI cropping
+        cam.isp.link(cam_out.input)
+        
+        # Initial ROI cropping. 3840x2160 => Square + InitCropping
         crop_manip = pipeline.create(dai.node.ImageManip)
-        crop_manip.initialConfig.setCropRect(INITIAL_CROP)
-        crop_manip.inputImage.setQueueSize(3)
-        maxSize = int(2160 * INITIAL_CROP[3] - INITIAL_CROP[1]) * int(2160 * INITIAL_CROP[2] - INITIAL_CROP[0])
-        crop_manip.setMaxOutputFrameSize(maxSize*3) # Worst case
-        cam.preview.link(crop_manip.inputImage)
+        crop_manip.initialConfig.setCropRect(initial_crop_manip.get_tuple())
+        crop_manip.inputImage.setQueueSize(1)
+        crop_manip.inputImage.setBlocking(False)
+        crop_manip.setMaxOutputFrameSize(initial_crop_manip.calc_shape_size((3840,2160)))
+        crop_manip.setNumFramesPool(2)
+        crop_manip.setFrameType(dai.ImgFrame.Type.BGR888p)
+        cam.video.link(crop_manip.inputImage)
+
+        crop_manip_out = pipeline.create(dai.node.XLinkOut)
+        crop_manip_out.setStreamName("crop_manip_out")
+        cam.video.link(crop_manip_out.input)
 
         downscale_manip = pipeline.create(dai.node.ImageManip)
         downscale_manip.setMaxOutputFrameSize(self.pd_input_length*self.pd_input_length*3)
         downscale_manip.initialConfig.setResize(self.pd_input_length, self.pd_input_length)
         crop_manip.out.link(downscale_manip.inputImage)
 
-        # For debugging
-        # manip_out = pipeline.createXLinkOut()
-        # manip_out.setStreamName("manip_out")
-        # manip.out.link(manip_out.input)
+        
 
         # Define pose detection model
         print("Creating Pose Detection Neural Network...")
@@ -229,10 +277,10 @@ class MovenetDepthai:
 
         manip_script.setScript("""
         import marshal
-        REGION = 192
+        REGION = 0.035 # For QR Code
         while True:
             frame = node.io['frame'].get()
-            node.warn(f"{frame.getWidth()}x{frame.getHeight()}")
+            # node.warn(f"{frame.getWidth()}x{frame.getHeight()}")
             pdin = node.io['pd_in'].get()
             result = marshal.loads(pdin.getData())
             keypoints = list(zip(result["xnorm"], result["ynorm"]))
@@ -240,49 +288,40 @@ class MovenetDepthai:
             right_wrist = keypoints[10]
             coords = left_wrist if left_wrist[1] < right_wrist[1] else right_wrist
 
-            NORM_REG_X = REGION / frame.getWidth()
-            NORM_REG_Y = REGION / frame.getHeight()
-
-            xmin = coords[0] - NORM_REG_X
-            ymin = coords[1] - NORM_REG_Y
+            xmin = coords[0] - REGION
+            ymin = coords[1] - REGION
             if xmin < 0: xmin = 0.0
             if ymin < 0: ymin = 0.0
-            xmax = xmin + 2 * NORM_REG_X
-            ymax = ymin + 2 * NORM_REG_Y
+            xmax = xmin + 2 * REGION
+            ymax = ymin + 2 * REGION
             if 1 < xmax: xmax = 1.0
             if 1 < ymax: ymax = 1.0
             # node.warn(f"{coords[0]}, {coords[1]}")
 
             cfg = ImageManipConfig()
-            node.warn(f"{xmin}, {ymin}, {xmax}, {ymax}")
+            # node.warn(f"{xmin}, {ymin}, {xmax}, {ymax}")
             cfg.setCropRect(xmin, ymin, xmax, ymax)
-            cfg.setResize(384, 384)
-            cfg.setKeepAspectRatio(False)
+            # cfg.setKeepAspectRatio(False)
             node.io['manip_cfg'].send(cfg)
             node.io['manip_img'].send(frame)
             # node.warn(keypoints)
         """)
 
         qr_manip = pipeline.create(dai.node.ImageManip)
-        qr_manip.initialConfig.setResize(384, 384)
-        qr_manip.setMaxOutputFrameSize(384 * 384 * 3)
+        qr_manip.setMaxOutputFrameSize(600 * 600 * 3)
         qr_manip.setWaitForConfigInput(True)
         manip_script.outputs['manip_cfg'].link(qr_manip.inputConfig)
         manip_script.outputs['manip_img'].link(qr_manip.inputImage)
 
-        crop_out = pipeline.create(dai.node.XLinkOut)
-        crop_out.setStreamName("crop_out")
-        qr_manip.out.link(crop_out.input)
-        
-        qr_nn = pipeline.create(dai.node.MobileNetDetectionNetwork)
-        qr_nn.setConfidenceThreshold(0.3)
-        qr_nn.setBlobPath(blobconverter.from_zoo(name="qr_code_detection_384x384", zoo_type="depthai", shaves=6))
-        qr_manip.out.link(qr_nn.input)
+        cfg_out = pipeline.createXLinkOut()
+        cfg_out.setStreamName("cfg_out")
+        manip_script.outputs['manip_cfg'].link(cfg_out.input)
 
-        qr_out = pipeline.create(dai.node.XLinkOut)
-        qr_out.setStreamName("qr_out")
-        qr_nn.out.link(qr_out.input)
-
+        # For debugging
+        if DEBUG:
+            crop_out = pipeline.createXLinkOut()
+            crop_out.setStreamName("crop_out")
+            qr_manip.out.link(crop_out.input)
 
         print("Pipeline created.")
 
@@ -297,20 +336,25 @@ class MovenetDepthai:
 
     def next_frame(self):
         in_video = self.q_video.get()
-        frame = cv2.resize(in_video.getCvFrame(), (1280, 720)) # 4k -> 720P (divided by 3)
+        f = in_video.getCvFrame()
+        self.hq = f
+        frame = cv2.resize(f, DOWNSCALE_48MP)
+        
         # Initial ROI visualization
-        frame = cv2.rectangle(frame,
-            (int(INITIAL_CROP[0] * 720 + 280), int(INITIAL_CROP[1] * 720)),
-            (int(INITIAL_CROP[2] * 720 + 280), int(INITIAL_CROP[3] * 720)),
-            (0, 127, 255), 2)
+        if DEBUG:
+            topLeft, bottomRight = isp_to_video.normalize_to_frame(frame)
+            frame = cv2.rectangle(frame, topLeft, bottomRight, (127, 255, 255), 1)
+
+            topLeft, bottomRight = crop_square.normalize_to_frame(frame)
+            frame = cv2.rectangle(frame, topLeft, bottomRight, (255, 127, 255), 1)
+
+            topLeft, bottomRight = initial_crop.normalize_to_frame(frame)
+            frame = cv2.rectangle(frame, topLeft, bottomRight, (0, 127, 255), 1)
+
         # Get result from device
         inference = self.q_processing_out.get()
         body = self.pd_postprocess(inference)
 
-        # Statistics
-        if self.stats:
-            self.nb_frames += 1
-            self.nb_pd_inferences += 1
         return frame, body
 
 
@@ -332,17 +376,19 @@ class MovenetDepthai:
                 else:
                     color = (0,0,255)
                 cv2.circle(frame, (x_y[0], x_y[1]), 4, color, -11)
-    
-    def expandDetection(self, det, percent=2):
-        percent /= 100
-        det.xmin -= percent
-        det.ymin -= percent
-        det.xmax += percent
-        det.ymax += percent
-        if det.xmin < 0: det.xmin = 0
-        if det.ymin < 0: det.ymin = 0
-        if det.xmax > 1: det.xmax = 1
-        if det.ymax > 1: det.ymax = 1
+
+    def decode(self, frame):
+        try:
+            data, vertices_array, binary_qrcode = self.detector.detectAndDecode(frame)
+            if data:
+                print("Decoded text", data)
+                return data
+            else:
+                print("Decoding failed")
+                return ""
+        except:
+            print("Exception")
+            return ""
 
     # nn data, being the bounding box locations, are in <0..1> range - they need to be normalized with frame width/height
     def frameNorm(self, frame, bbox):
@@ -353,39 +399,83 @@ class MovenetDepthai:
     def run(self):
         self.q_video = self.device.getOutputQueue(name="cam_out")
         self.q_processing_out = self.device.getOutputQueue(name="processing_out")
-        q_crop_out = self.device.getOutputQueue(name="crop_out")
-        q_qr = self.device.getOutputQueue(name="qr_out")
+        q_cfg = self.device.getOutputQueue(name="cfg_out")
+
+        q_control = self.device.getInputQueue("cam_control")
+        crop_manip_q = self.device.getOutputQueue(name="crop_manip_out")
+        if DEBUG:
+            q_crop_out = self.device.getOutputQueue(name="crop_out")
 
         c = TextHelper()
+        camControl = CamControl(q_control)
 
         crop_frame = None
-        detections = []
+        cfg_bb = None # Cfg for QR code detection
+
+        decText = ""
+        decTime = time.time()
+
+        if DECODE:
+            self.detector = cv2.QRCodeDetector()
 
         while True:
             # Run movenet on next frame
             frame, body = self.next_frame()
             self.draw(frame, body)
-            cv2.imshow("frame", frame)
 
-            if q_crop_out.has():
-                crop_frame = q_crop_out.get().getCvFrame()
+            if crop_manip_q.has():
+                downscale = cv2.pyrDown(crop_manip_q.get().getCvFrame())
+                cv2.imshow('IMX582 video output', cv2.pyrDown(downscale))
 
-            if q_qr.has():
-                detections = q_qr.get().detections
-                print('new detections', len(detections))
+            if q_cfg.has():
+                bb = q_cfg.get().getRaw().cropConfig.cropRect
+                cfg_bb = initial_crop.calculate_new_bb(bb) # Crop based on INITIAL_CROP
+                if DEBUG:
+                    topLeft, bottomRight = cfg_bb.normalize_to_frame(frame)
 
-            if crop_frame is not None:
-                for det in detections:
-                    self.expandDetection(det)
-                    bbox = self.frameNorm(crop_frame, (det.xmin, det.ymin, det.xmax, det.ymax))
-                    c.rectangle(crop_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]))
-                    c.putText(crop_frame, f"{int(det.confidence * 100)}%", (bbox[0] + 10, bbox[1] + 20))
-                    # if DECODE:
-                    #     text = decode(frame, bbox, detector)
-                    #     c.putText(frame, text, (bbox[0] + 10, bbox[1] + 40))
-                cv2.imshow("Hand Cropped", crop_frame)
+                    # camControl = dai.CameraControl()
+                    # camControl.setAutoExposureRegion(topLeft[0], topLeft[1], bottomRight[0], bottomRight[1])
+                    # q_control.send(camControl)
 
+                    c.rectangle(frame, topLeft, bottomRight, (255,127,0))
+                    crop_frame = cfg_bb.crop_frame(self.hq)
+                    cv2.imshow("Crop2", crop_frame)
+                    # print(topLeft, bottomRight)
+                    if DECODE:
+                        decoded = decode(crop_frame)
+                        if 0 < len(decoded):
+                            decText = decoded[0].data
+                            print(decText)
+                            decTime = time.time()
+
+                        if time.time() - decTime < 3.0:
+                            c.putText(frame, decText, (20,60), size=3, thickness=2)
+
+            if DEBUG:
+                if q_crop_out.has():
+                    crop_frame = q_crop_out.get().getCvFrame()
+                    cv2.imshow("[DEBUG] Hand Cropped", crop_frame)
+
+                
+            # if q_qr.has():
+                # detections = q_qr.get().detections
+                # # print('new detections', len(detections))
+
+                # for det in detections:
+                    # self.expandDetection(det, 5)
+                    # qr_bb = cfg_bb.calculate_new_bb(det)
+                    # qrCodeFrame = qr_bb.crop_frame(self.hq)
+                    # cv2.imshow("QR code frame", qrCodeFrame)
+                    
+                    # topLeft, bottomRight = qr_bb.normalize_to_frame(frame)
+                    # c.rectangle(frame, topLeft, bottomRight, (0,255,100))
+                    # c.putText(frame, f"{int(det.confidence * 100)}%", (topLeft[0] + 10, topLeft[1] + 20))
+
+            cv2.imshow("IMX582 ISP output", frame)
             key = cv2.waitKey(1)
+
+            camControl.check_key(key)
+
             if key == 27 or key == ord('q'):
                 break
            

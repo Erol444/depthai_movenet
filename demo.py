@@ -28,12 +28,9 @@ args = parser.parse_args()
 
 from MovenetDepthaiEdge import MovenetDepthai
 
-pose = MovenetDepthai(input_src=args.input, 
+pose = MovenetDepthai(
             model=args.model,    
             score_thresh=args.score_threshold,  
-            crop=args.crop,    
-            smart_crop=not args.no_smart_crop,     
-            internal_fps=args.internal_fps,
             )
 
 pose.run()
