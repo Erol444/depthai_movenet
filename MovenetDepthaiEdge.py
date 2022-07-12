@@ -13,7 +13,9 @@ MOVENET_THUNDER_MODEL = SCRIPT_DIR / "models/movenet_singlepose_thunder_U8_trans
 
 #-------------[USER CONFIG]-----------
 
-CROP_ROI = (0.1, 0.1, 0.9, 0.9) # Set ROI for initial cropping
+# No cropping by default
+CROP_ROI = (0.0, 0.0, 1.0, 1.0) # Set ROI for initial cropping
+
 DEBUG = True # Whether to debug the app (show additional frames, bounding boxes)
 DECODE = True # Decode QR code
 #-------------------------------------
@@ -95,7 +97,7 @@ class BoundingBox:
 
 
 # We send ISP frame (5312x6000) to the device, but use 4k video frame (3840x2160) in the pipeline (crop/detection)
-isp_to_video = BoundingBox((0.0, 0.248987513, 1.0, 0.751012487))
+isp_to_video = BoundingBox((0.13855, 0.32, 0.86145, 0.68))
 
 DOWNSCALE_48MP = (885, 1000) # Downscale by 5
 
@@ -200,7 +202,6 @@ class MovenetDepthai:
         pipeline = dai.Pipeline()
         pipeline.setOpenVINOVersion(dai.OpenVINO.Version.VERSION_2021_4)
 
-
         # ColorCamera
         print("Creating Color Camera...")
         cam = pipeline.create(dai.node.ColorCamera) 
@@ -223,7 +224,7 @@ class MovenetDepthai:
         cam_out = pipeline.create(dai.node.XLinkOut)
         cam_out.setStreamName("cam_out")
         cam.isp.link(cam_out.input)
-        
+
         # Initial ROI cropping. 3840x2160 => Square + InitCropping
         crop_manip = pipeline.create(dai.node.ImageManip)
         crop_manip.initialConfig.setCropRect(initial_crop_manip.get_tuple())
@@ -243,7 +244,6 @@ class MovenetDepthai:
         downscale_manip.initialConfig.setResize(self.pd_input_length, self.pd_input_length)
         crop_manip.out.link(downscale_manip.inputImage)
 
-        
 
         # Define pose detection model
         print("Creating Pose Detection Neural Network...")
