@@ -274,16 +274,10 @@ class MovenetDepthai:
         manip_script.setProcessor(dai.ProcessorType.LEON_CSS)
         processing_script.outputs['to_host'].link(manip_script.inputs['pd_in']) # Pose detections
         
-        crop_manip.out.link(manip_script.inputs['frame']) # Cropped HQ frame
-        manip_script.inputs['frame'].setBlocking(False)
-        manip_script.inputs['frame'].setQueueSize(1)
-
         manip_script.setScript("""
         import marshal
-        REGION = 0.05 # For QR Code
+        REGION = 0.1 # For QR Code
         while True:
-            frame = node.io['frame'].get()
-            # node.warn(f"{frame.getWidth()}x{frame.getHeight()}")
             pdin = node.io['pd_in'].get()
             result = marshal.loads(pdin.getData())
             keypoints = list(zip(result["xnorm"], result["ynorm"]))
@@ -306,25 +300,12 @@ class MovenetDepthai:
             cfg.setCropRect(xmin, ymin, xmax, ymax)
             # cfg.setKeepAspectRatio(False)
             node.io['manip_cfg'].send(cfg)
-            node.io['manip_img'].send(frame)
             # node.warn(keypoints)
         """)
-
-        qr_manip = pipeline.create(dai.node.ImageManip)
-        qr_manip.setMaxOutputFrameSize(600 * 600 * 3)
-        qr_manip.setWaitForConfigInput(True)
-        manip_script.outputs['manip_cfg'].link(qr_manip.inputConfig)
-        manip_script.outputs['manip_img'].link(qr_manip.inputImage)
 
         cfg_out = pipeline.createXLinkOut()
         cfg_out.setStreamName("cfg_out")
         manip_script.outputs['manip_cfg'].link(cfg_out.input)
-
-        # For debugging
-        if DEBUG:
-            crop_out = pipeline.createXLinkOut()
-            crop_out.setStreamName("crop_out")
-            qr_manip.out.link(crop_out.input)
 
         print("Pipeline created.")
 
@@ -405,8 +386,6 @@ class MovenetDepthai:
 
         q_control = self.device.getInputQueue("cam_control")
         crop_manip_q = self.device.getOutputQueue(name="crop_manip_out")
-        if DEBUG:
-            q_crop_out = self.device.getOutputQueue(name="crop_out")
 
         c = TextHelper()
         camControl = CamControl(q_control)
@@ -419,6 +398,8 @@ class MovenetDepthai:
 
         if DECODE:
             self.detector = cv2.QRCodeDetector()
+
+        qrWriter = cv2.VideoWriter('qr_code.avi', cv2.VideoWriter_fourcc(*'iYUV'), 4, (432, 432))
 
         while True:
             # Run movenet on next frame
@@ -442,7 +423,9 @@ class MovenetDepthai:
 
                     c.rectangle(frame, topLeft, bottomRight, (255,127,0))
                     crop_frame = cfg_bb.crop_frame(self.hq)
-                    cv2.imshow("Crop2", crop_frame)
+                    print(crop_frame.shape)
+                    qrWriter.write(crop_frame)
+                    cv2.imshow("QR Code crop", crop_frame)
                     # print(topLeft, bottomRight)
                     if DECODE:
                         decoded = decode(crop_frame)
@@ -453,11 +436,6 @@ class MovenetDepthai:
 
                         if time.time() - decTime < 3.0:
                             c.putText(frame, decText, (20,60), size=3, thickness=3)
-
-            if DEBUG:
-                if q_crop_out.has():
-                    crop_frame = q_crop_out.get().getCvFrame()
-                    cv2.imshow("[DEBUG] Hand Cropped", crop_frame)
 
                 
             # if q_qr.has():
@@ -481,4 +459,5 @@ class MovenetDepthai:
 
             if key == 27 or key == ord('q'):
                 break
+        qrWriter.release()
            
