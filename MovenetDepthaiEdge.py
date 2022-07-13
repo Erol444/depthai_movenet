@@ -205,8 +205,11 @@ class MovenetDepthai:
         # ColorCamera
         print("Creating Color Camera...")
         cam = pipeline.create(dai.node.ColorCamera) 
-        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_13_MP) # 5312x6000 IMX582
-        cam.initialControl.setManualFocus(40)
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_48_MP) # 5312x6000 IMX582
+        cam.setIspNumFramesPool(2)
+        cam.setVideoNumFramesPool(2)
+        cam.initialControl.setManualFocus(63)
+        cam.initialControl.setManualExposure(10500, 300)
         cam.setInterleaved(False)
         cam.setFps(5)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
@@ -277,7 +280,7 @@ class MovenetDepthai:
 
         manip_script.setScript("""
         import marshal
-        REGION = 0.035 # For QR Code
+        REGION = 0.05 # For QR Code
         while True:
             frame = node.io['frame'].get()
             # node.warn(f"{frame.getWidth()}x{frame.getHeight()}")
@@ -335,8 +338,7 @@ class MovenetDepthai:
         return body
 
     def next_frame(self):
-        in_video = self.q_video.get()
-        f = in_video.getCvFrame()
+        f = self.q_video.get().getCvFrame()
         self.hq = f
         frame = cv2.resize(f, DOWNSCALE_48MP)
         
@@ -424,8 +426,9 @@ class MovenetDepthai:
             self.draw(frame, body)
 
             if crop_manip_q.has():
-                downscale = cv2.pyrDown(crop_manip_q.get().getCvFrame())
-                cv2.imshow('IMX582 video output', cv2.pyrDown(downscale))
+                crop4k = crop_manip_q.get().getCvFrame()
+                crop4k = cv2.pyrDown(crop4k)
+                cv2.imshow('IMX582 video output', cv2.pyrDown(crop4k))
 
             if q_cfg.has():
                 bb = q_cfg.get().getRaw().cropConfig.cropRect
@@ -444,12 +447,12 @@ class MovenetDepthai:
                     if DECODE:
                         decoded = decode(crop_frame)
                         if 0 < len(decoded):
-                            decText = decoded[0].data
+                            decText = str(decoded[0].data)
                             print(decText)
                             decTime = time.time()
 
                         if time.time() - decTime < 3.0:
-                            c.putText(frame, decText, (20,60), size=3, thickness=2)
+                            c.putText(frame, decText, (20,60), size=3, thickness=3)
 
             if DEBUG:
                 if q_crop_out.has():
