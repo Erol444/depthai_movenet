@@ -6,6 +6,7 @@ import cv2
 import time
 import math
 from cam_control import CamControl
+import webbrowser
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MOVENET_LIGHTNING_MODEL = SCRIPT_DIR / "models/movenet_singlepose_lightning_U8_transpose.blob"
@@ -441,7 +442,9 @@ class MovenetDepthai:
                             decTime = time.time()
                             decText = str(text[0])
                             c.rectangle(crop_frame, bbox[0][0], bbox[0][2])
-                            c.putText(crop_frame, text[0], (bbox[0][0][0] + 10, bbox[0][0][1] + 40))
+                            if decText.startswith("http://") or decText.startswith("https://"):
+                                webbrowser.open(decText,new=True)
+                                break
                         # else:
                             # print("WeChatQRCode wasn't able to detect any QR codes!")
                             # continue
