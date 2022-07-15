@@ -3,10 +3,10 @@ import numpy as np
 from pathlib import Path
 import depthai as dai
 import cv2
-from pyzbar.pyzbar import decode
 import time
 import math
 from cam_control import CamControl
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 MOVENET_LIGHTNING_MODEL = SCRIPT_DIR / "models/movenet_singlepose_lightning_U8_transpose.blob"
 MOVENET_THUNDER_MODEL = SCRIPT_DIR / "models/movenet_singlepose_thunder_U8_transpose.blob"
@@ -399,7 +399,12 @@ class MovenetDepthai:
         if DECODE:
             self.detector = cv2.QRCodeDetector()
 
-        qrWriter = cv2.VideoWriter('qr_code.avi', cv2.VideoWriter_fourcc(*'iYUV'), 4, (432, 432))
+        wechat_detector = cv2.wechat_qrcode_WeChatQRCode(
+            "./models/detect.prototxt", 
+            "./models/detect.caffemodel", 
+            "./models/sr.prototxt", 
+            "./models/sr.caffemodel"
+        )
 
         while True:
             # Run movenet on next frame
@@ -423,34 +428,26 @@ class MovenetDepthai:
 
                     c.rectangle(frame, topLeft, bottomRight, (255,127,0))
                     crop_frame = cfg_bb.crop_frame(self.hq)
-                    print(crop_frame.shape)
-                    qrWriter.write(crop_frame)
+                    # qrWriter.write(crop_frame)
                     cv2.imshow("QR Code crop", crop_frame)
                     # print(topLeft, bottomRight)
                     if DECODE:
-                        decoded = decode(crop_frame)
-                        if 0 < len(decoded):
-                            decText = str(decoded[0].data)
-                            print(decText)
+                        text, bbox = wechat_detector.detectAndDecode(crop_frame)
+                        if text == () and bbox != ():
+                            bbox = [bbox[0].astype(int)]
+                            c.rectangle(crop_frame, bbox[0][0], bbox[0][2], color=(0, 0, 255))
+                        elif text != () and bbox != ():
+                            bbox = [bbox[0].astype(int)]
                             decTime = time.time()
+                            decText = str(text[0])
+                            c.rectangle(crop_frame, bbox[0][0], bbox[0][2])
+                            c.putText(crop_frame, text[0], (bbox[0][0][0] + 10, bbox[0][0][1] + 40))
+                        # else:
+                            # print("WeChatQRCode wasn't able to detect any QR codes!")
+                            # continue
 
-                        if time.time() - decTime < 3.0:
+                        if time.time() - decTime < 0.5:
                             c.putText(frame, decText, (20,60), size=3, thickness=3)
-
-                
-            # if q_qr.has():
-                # detections = q_qr.get().detections
-                # # print('new detections', len(detections))
-
-                # for det in detections:
-                    # self.expandDetection(det, 5)
-                    # qr_bb = cfg_bb.calculate_new_bb(det)
-                    # qrCodeFrame = qr_bb.crop_frame(self.hq)
-                    # cv2.imshow("QR code frame", qrCodeFrame)
-                    
-                    # topLeft, bottomRight = qr_bb.normalize_to_frame(frame)
-                    # c.rectangle(frame, topLeft, bottomRight, (0,255,100))
-                    # c.putText(frame, f"{int(det.confidence * 100)}%", (topLeft[0] + 10, topLeft[1] + 20))
 
             cv2.imshow("IMX582 ISP output", frame)
             key = cv2.waitKey(1)
@@ -459,5 +456,4 @@ class MovenetDepthai:
 
             if key == 27 or key == ord('q'):
                 break
-        qrWriter.release()
            
