@@ -1,4 +1,4 @@
 opencv-python>=4
 opencv-contrib-python==4.6.0.66
-depthai==2.17.0.0.dev0+7814b03c8c2e367cd1fcfc91e39c8166f06c0d4e
+depthai==2.17.2.0.dev+211dc1c0a135d5615dba75ebf2098ba8cdc05cd0
 --extra-index-url https://artifacts.luxonis.com/artifactory/luxonis-python-snapshot-local/
