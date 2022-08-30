@@ -205,13 +205,16 @@ class MovenetDepthai:
 
         # ColorCamera
         print("Creating Color Camera...")
-        cam = pipeline.create(dai.node.ColorCamera) 
+        cam = pipeline.createColorCamera()
         cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_48_MP) # 5312x6000 IMX582
         cam.setIspNumFramesPool(2)
         cam.setVideoNumFramesPool(2)
-        cam.initialControl.setManualFocus(63)
-        cam.initialControl.setManualExposure(10500, 300)
+        cam.initialControl.setManualFocus(231)
+        cam.initialControl.setManualExposure(50000, 150)
         cam.setInterleaved(False)
+        cam.initialControl.setChromaDenoise(4)
+        cam.initialControl.setLumaDenoise(2)
+        cam.initialControl.setSharpness(1)
         cam.setFps(5)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
